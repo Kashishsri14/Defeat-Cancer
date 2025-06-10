@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import {
   IconChevronRight,
   IconFileUpload,
@@ -20,14 +20,27 @@ function SingleRecordDetails() {
   const [uploading, setUploading] = useState(false);
   const [uploadSuccess, setUploadSuccess] = useState(false);
   const [processing, setIsProcessing] = useState(false);
-  const [analysisResult, setAnalysisResult] = useState(
-    state.analysisResult || "",
-  );
+  const [analysisResult, setAnalysisResult] = useState("");
   const [filename, setFilename] = useState("");
   const [filetype, setFileType] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [error, setError] = useState(null);
 
   const { updateRecord } = useStateContext();
+
+  // Initialize analysis result from state on component mount
+  useEffect(() => {
+    if (state?.analysisResult) {
+      setAnalysisResult(state.analysisResult);
+    }
+  }, [state?.analysisResult]);
+
+  // Add error boundary for missing state
+  useEffect(() => {
+    if (!state || !state.id) {
+      setError("Invalid record state. Please navigate from the records list.");
+    }
+  }, [state]);
 
   const handleOpenModal = () => {
     setIsModalOpen(true);
@@ -35,14 +48,23 @@ function SingleRecordDetails() {
 
   const handleCloseModal = () => {
     setIsModalOpen(false);
+    // Reset file-related state when closing modal
+    setFile(null);
+    setFilename("");
+    setFileType("");
+    setUploadSuccess(false);
+    setError(null);
   };
 
   const handleFileChange = (e) => {
-    const file = e.target.files[0];
-    console.log("Selected file:", file);
-    setFileType(file.type);
-    setFilename(file.name);
-    setFile(file);
+    const selectedFile = e.target.files[0];
+    if (selectedFile) {
+      console.log("Selected file:", selectedFile);
+      setFileType(selectedFile.type);
+      setFilename(selectedFile.name);
+      setFile(selectedFile);
+      setError(null);
+    }
   };
 
   const readFileAsBase64 = (file) => {
@@ -55,12 +77,22 @@ function SingleRecordDetails() {
   };
 
   const handleFileUpload = async () => {
+    if (!file) {
+      setError("Please select a file first.");
+      return;
+    }
+
+    if (!geminiApiKey) {
+      setError("Gemini API key is not configured.");
+      return;
+    }
+
     setUploading(true);
     setUploadSuccess(false);
-
-    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    setError(null);
 
     try {
+      const genAI = new GoogleGenerativeAI(geminiApiKey);
       const base64Data = await readFileAsBase64(file);
 
       const imageParts = [
@@ -81,19 +113,28 @@ function SingleRecordDetails() {
       const result = await model.generateContent([prompt, ...imageParts]);
       const response = await result.response;
       const text = response.text();
+
       setAnalysisResult(text);
-      const updatedRecord = await updateRecord({
-        documentID: state.id,
-        analysisResult: text,
-        kanbanRecords: "",
-      });
+
+      // Only update record if we have a valid state
+      if (state?.id) {
+        await updateRecord({
+          documentID: state.id,
+          analysisResult: text,
+          kanbanRecords: "",
+        });
+      }
+
       setUploadSuccess(true);
-      setIsModalOpen(false); // Close the modal after a successful upload
+      setIsModalOpen(false);
+
+      // Reset file state
       setFilename("");
       setFile(null);
       setFileType("");
     } catch (error) {
       console.error("Error uploading file:", error);
+      setError(`Upload failed: ${error.message}`);
       setUploadSuccess(false);
     } finally {
       setUploading(false);
@@ -101,20 +142,31 @@ function SingleRecordDetails() {
   };
 
   const processTreatmentPlan = async () => {
+    if (!analysisResult) {
+      setError("No analysis result available. Please upload a file first.");
+      return;
+    }
+
+    if (!geminiApiKey) {
+      setError("Gemini API key is not configured.");
+      return;
+    }
+
     setIsProcessing(true);
+    setError(null);
 
-    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    try {
+      const genAI = new GoogleGenerativeAI(geminiApiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-
-    const prompt = `Your role and goal is to be an that will be using this treatment plan ${analysisResult} to create Columns:
+      const prompt = `Your role and goal is to be an that will be using this treatment plan ${analysisResult} to create Columns:
                 - Todo: Tasks that need to be started
                 - Doing: Tasks that are in progress
                 - Done: Tasks that are completed
           
                 Each task should include a brief description. The tasks should be categorized appropriately based on the stage of the treatment process.
           
-                Please provide the results in the following  format for easy front-end display no quotating or what so ever just pure the structure below:
+                Please provide the results in the following format for easy front-end display no quotation marks or extra formatting, just the pure JSON structure below:
 
                 {
                   "columns": [
@@ -129,36 +181,75 @@ function SingleRecordDetails() {
                     { "id": "4", "columnId": "doing", "content": "Example task 4" },
                     { "id": "5", "columnId": "done", "content": "Example task 5" }
                   ]
-                }
-                            
-                `;
+                }`;
 
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
-    const parsedResponse = JSON.parse(text);
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
 
-    console.log(text);
-    console.log(parsedResponse);
-    const updatedRecord = await updateRecord({
-      documentID: state.id,
-      kanbanRecords: text,
-    });
-    console.log(updatedRecord);
-    navigate("/screening-schedules", { state: parsedResponse });
-    setIsProcessing(false);
+      // Clean the response text to ensure valid JSON
+      const cleanedText = text.replace(/```json|```/g, "").trim();
+
+      let parsedResponse;
+      try {
+        parsedResponse = JSON.parse(cleanedText);
+      } catch (parseError) {
+        throw new Error(`Invalid JSON response: ${parseError.message}`);
+      }
+
+      console.log("Parsed response:", parsedResponse);
+
+      // Only update record if we have a valid state
+      if (state?.id) {
+        await updateRecord({
+          documentID: state.id,
+          kanbanRecords: cleanedText,
+        });
+      }
+
+      navigate("/screening-schedules", { state: parsedResponse });
+    } catch (error) {
+      console.error("Error processing treatment plan:", error);
+      setError(`Processing failed: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
+    }
   };
+
+  // Show error state if there's an error
+  if (error && (!state || !state.id)) {
+    return (
+      <div className="flex min-h-[400px] flex-col items-center justify-center text-center">
+        <h2 className="mb-2 text-xl font-semibold text-red-600">Error</h2>
+        <p className="text-gray-600 dark:text-gray-400">{error}</p>
+        <button
+          onClick={() => navigate(-1)}
+          className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+        >
+          Go Back
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-wrap gap-[26px]">
+      {error && (
+        <div className="mb-4 w-full rounded-lg border border-red-200 bg-red-50 p-4">
+          <p className="text-red-800">{error}</p>
+        </div>
+      )}
+
       <button
         type="button"
         onClick={handleOpenModal}
+        disabled={uploading || processing}
         className="mt-6 inline-flex items-center gap-x-2 rounded-full border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50 disabled:pointer-events-none disabled:opacity-50 dark:border-neutral-700 dark:bg-[#13131a] dark:text-white dark:hover:bg-neutral-800"
       >
         <IconFileUpload />
         Upload Reports
       </button>
+
       <FileUploadModal
         isOpen={isModalOpen}
         onClose={handleCloseModal}
@@ -168,7 +259,9 @@ function SingleRecordDetails() {
         uploadSuccess={uploadSuccess}
         filename={filename}
       />
-      <RecordDetailsHeader recordName={state.recordName} />
+
+      <RecordDetailsHeader recordName={state?.recordName || "Unknown Record"} />
+
       <div className="w-full">
         <div className="flex flex-col">
           <div className="-m-1.5 overflow-x-auto">
@@ -188,20 +281,28 @@ function SingleRecordDetails() {
                       Analysis Result
                     </h2>
                     <div className="space-y-2">
-                      <ReactMarkdown>{analysisResult}</ReactMarkdown>
+                      {analysisResult ? (
+                        <ReactMarkdown>{analysisResult}</ReactMarkdown>
+                      ) : (
+                        <p className="italic text-gray-500 dark:text-gray-400">
+                          No analysis result available. Please upload a medical
+                          report to get started.
+                        </p>
+                      )}
                     </div>
                   </div>
                   <div className="mt-5 grid gap-2 sm:flex">
                     <button
                       type="button"
                       onClick={processTreatmentPlan}
+                      disabled={!analysisResult || processing || uploading}
                       className="inline-flex items-center gap-x-2 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-800 shadow-sm hover:bg-gray-50 disabled:pointer-events-none disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white dark:hover:bg-neutral-800"
                     >
                       View Treatment plan
                       <IconChevronRight size={20} />
                       {processing && (
                         <IconProgress
-                          size={10}
+                          size={20}
                           className="mr-3 h-5 w-5 animate-spin"
                         />
                       )}
@@ -211,7 +312,7 @@ function SingleRecordDetails() {
                 <div className="grid gap-3 border-t border-gray-200 px-6 py-4 md:flex md:items-center md:justify-between dark:border-neutral-700">
                   <div>
                     <p className="text-sm text-gray-600 dark:text-neutral-400">
-                      <span className="font-semibold text-gray-800 dark:text-neutral-200"></span>{" "}
+                      <span className="font-semibold text-gray-800 dark:text-neutral-200"></span>
                     </p>
                   </div>
                   <div>
